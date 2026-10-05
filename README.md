@@ -14,8 +14,9 @@ copy .env.example .env       # then set JWT_SECRET_KEY
 python server.py
 ```
 
-API at `http://localhost:5000`. Storage is local JSON files in `backend/data/`
-— no database setup. Endpoints are auth + families + devices + location only.
+API at `http://localhost:5000`. Storage is local MongoDB (`MONGO_URI` in
+`backend/.env`, default `mongodb://localhost:27017/nestpulse`) — make sure
+`mongod` is running. IDs are Mongo ObjectIds.
 
 ## Run the app
 

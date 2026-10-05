@@ -1,11 +1,10 @@
-import json
 import os
 import secrets
 import string
-import threading
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -18,6 +17,8 @@ from flask_jwt_extended import (
     jwt_required,
 )
 from flask_socketio import SocketIO, join_room
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError, ServerSelectionTimeoutError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
@@ -31,54 +32,67 @@ jwt = JWTManager(app)
 CORS(app, origins="*", allow_headers=["*"])
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", manage_session=False)
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/nestpulse")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "nestpulse")
 
-_file_locks: dict = {}
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = mongo_client[MONGO_DB_NAME]
+users_col = db["users"]
+families_col = db["families"]
+devices_col = db["devices"]
 
-def _lock(name: str) -> threading.Lock:
-    if name not in _file_locks:
-        _file_locks[name] = threading.Lock()
-    return _file_locks[name]
+try:
+    mongo_client.admin.command("ping")
+except ServerSelectionTimeoutError as e:
+    raise RuntimeError(
+        f"Cannot reach MongoDB at {MONGO_URI}. Is mongod running? "
+        "Set MONGO_URI in backend/.env if it lives elsewhere."
+    ) from e
 
-
-def _read(name: str) -> dict:
-    path = DATA_DIR / f"{name}.json"
-    with _lock(name):
-        if not path.exists():
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-
-def _write(name: str, data: dict) -> None:
-    path = DATA_DIR / f"{name}.json"
-    with _lock(name):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def _next_id(store: dict) -> str:
-    if not store:
-        return "1"
-    return str(max(int(k) for k in store.keys()) + 1)
+users_col.create_index("email", unique=True)
+families_col.create_index("invite_code", unique=True)
+devices_col.create_index([("family_id", 1), ("name", 1)])
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def users_db() -> dict:    return _read("users")
-def families_db() -> dict: return _read("families")
-def devices_db() -> dict:  return _read("devices")
+def _oid(id_str) -> ObjectId | None:
+    try:
+        return ObjectId(str(id_str))
+    except (InvalidId, TypeError):
+        return None
+
+
+def _serialize(doc: dict) -> dict:
+    doc = dict(doc)
+    doc["id"] = str(doc.pop("_id"))
+    return doc
 
 
 def get_user(user_id) -> dict | None:
-    return users_db().get(str(user_id))
+    oid = _oid(user_id)
+    if oid is None:
+        return None
+    doc = users_col.find_one({"_id": oid})
+    return _serialize(doc) if doc else None
 
 
 def get_family(family_id) -> dict | None:
-    return families_db().get(str(family_id))
+    oid = _oid(family_id)
+    if oid is None:
+        return None
+    doc = families_col.find_one({"_id": oid})
+    return _serialize(doc) if doc else None
+
+
+def get_device(device_id) -> dict | None:
+    oid = _oid(device_id)
+    if oid is None:
+        return None
+    doc = devices_col.find_one({"_id": oid})
+    return _serialize(doc) if doc else None
 
 
 def user_to_public(u: dict) -> dict:
@@ -86,8 +100,7 @@ def user_to_public(u: dict) -> dict:
 
 
 def device_to_dict(d: dict) -> dict:
-    users = users_db()
-    owner = users.get(str(d["owner_user_id"]))
+    owner = get_user(d["owner_user_id"])
     return {
         "id": d["id"],
         "name": d["name"],
@@ -101,8 +114,13 @@ def device_to_dict(d: dict) -> dict:
 
 
 def family_to_dict(f: dict, include_invite: bool = False) -> dict:
-    users = users_db()
-    members = [user_to_public(users[uid]) for uid in f.get("member_ids", []) if uid in users]
+    oids = [oid for uid in f.get("member_ids", []) if (oid := _oid(uid)) is not None]
+    members_by_id = {}
+    if oids:
+        for doc in users_col.find({"_id": {"$in": oids}}):
+            s = _serialize(doc)
+            members_by_id[s["id"]] = user_to_public(s)
+    members = [members_by_id[uid] for uid in f.get("member_ids", []) if uid in members_by_id]
     creator_id = f.get("creator_id") or (f["member_ids"][0] if f.get("member_ids") else None)
     result = {"id": f["id"], "name": f["name"], "members": members, "creator_id": creator_id}
     if include_invite:
@@ -134,22 +152,22 @@ def register():
     if not name or not email or len(password) < 6:
         return jsonify({"error": "name, email, and a password of 6+ characters are required"}), 400
 
-    users = users_db()
-    if any(u["email"] == email for u in users.values()):
+    if users_col.find_one({"email": email}):
         return jsonify({"error": "An account with that email already exists"}), 409
 
-    uid = _next_id(users)
-    user = {
-        "id": uid,
-        "name": name,
-        "email": email,
-        "password_hash": generate_password_hash(password),
-        "family_ids": [],
-        "created_at": _now_iso(),
-    }
-    users[uid] = user
-    _write("users", users)
+    try:
+        result = users_col.insert_one({
+            "name": name,
+            "email": email,
+            "password_hash": generate_password_hash(password),
+            "family_ids": [],
+            "created_at": _now_iso(),
+        })
+    except DuplicateKeyError:
+        return jsonify({"error": "An account with that email already exists"}), 409
 
+    user = _serialize(users_col.find_one({"_id": result.inserted_id}))
+    uid = user["id"]
     access_token = create_access_token(identity=uid)
     refresh_token = create_refresh_token(identity=uid)
     return jsonify({
@@ -166,8 +184,8 @@ def login():
         if not data or "email" not in data or "password" not in data:
             return jsonify({"error": "Missing email or password"}), 400
 
-        users = users_db()
-        user = next((u for u in users.values() if u["email"].lower() == data["email"].lower()), None)
+        doc = users_col.find_one({"email": data["email"].lower()})
+        user = _serialize(doc) if doc else None
 
         if not user or not check_password_hash(user["password_hash"], data["password"]):
             return jsonify({"error": "Invalid email or password"}), 401
@@ -204,10 +222,9 @@ def me():
 @jwt_required()
 def list_families():
     user = current_user()
-    families = families_db()
     result = []
     for fid in user.get("family_ids", []):
-        f = families.get(str(fid))
+        f = get_family(fid)
         if f:
             result.append(family_to_dict(f, include_invite=True))
     return jsonify(result)
@@ -222,24 +239,25 @@ def create_family():
     if not name:
         return jsonify({"error": "Family name is required"}), 400
 
-    families = families_db()
-    users = users_db()
+    family = None
+    for _ in range(5):
+        try:
+            result = families_col.insert_one({
+                "name": name,
+                "invite_code": generate_invite_code(),
+                "creator_id": user["id"],
+                "member_ids": [user["id"]],
+                "created_at": _now_iso(),
+            })
+            family = _serialize(families_col.find_one({"_id": result.inserted_id}))
+            break
+        except DuplicateKeyError:
+            continue
+    if family is None:
+        return jsonify({"error": "Could not generate a unique invite code, please retry"}), 500
 
-    fid = _next_id(families)
-    family = {
-        "id": fid,
-        "name": name,
-        "invite_code": generate_invite_code(),
-        "creator_id": user["id"],
-        "member_ids": [user["id"]],
-        "created_at": _now_iso(),
-    }
-    families[fid] = family
-    _write("families", families)
-
-    if fid not in users[user["id"]].get("family_ids", []):
-        users[user["id"]].setdefault("family_ids", []).append(fid)
-        _write("users", users)
+    fid = family["id"]
+    users_col.update_one({"_id": _oid(user["id"])}, {"$addToSet": {"family_ids": fid}})
 
     return jsonify(family_to_dict(family, include_invite=True)), 201
 
@@ -253,24 +271,18 @@ def join_family():
     if not invite_code:
         return jsonify({"error": "invite_code is required"}), 400
 
-    families = families_db()
-    family = next((f for f in families.values() if f["invite_code"] == invite_code), None)
-    if not family:
+    doc = families_col.find_one({"invite_code": invite_code})
+    if not doc:
         return jsonify({"error": "Invite code not found"}), 404
+    family = _serialize(doc)
 
     fid = family["id"]
-    users = users_db()
     uid = user["id"]
 
-    if uid not in family.get("member_ids", []):
-        families[fid]["member_ids"].append(uid)
-        _write("families", families)
+    families_col.update_one({"_id": _oid(fid)}, {"$addToSet": {"member_ids": uid}})
+    users_col.update_one({"_id": _oid(uid)}, {"$addToSet": {"family_ids": fid}})
 
-    if fid not in users[uid].get("family_ids", []):
-        users[uid].setdefault("family_ids", []).append(fid)
-        _write("users", users)
-
-    return jsonify(family_to_dict(families[fid], include_invite=True))
+    return jsonify(family_to_dict(get_family(fid), include_invite=True))
 
 
 @app.get("/api/families/<family_id>")
@@ -291,16 +303,9 @@ def leave_family(family_id):
     user = current_user()
     uid = user["id"]
     fid = str(family_id)
-    users = users_db()
-    families = families_db()
 
-    if fid in users[uid].get("family_ids", []):
-        users[uid]["family_ids"].remove(fid)
-        _write("users", users)
-
-    if uid in families.get(fid, {}).get("member_ids", []):
-        families[fid]["member_ids"].remove(uid)
-        _write("families", families)
+    users_col.update_one({"_id": _oid(uid)}, {"$pull": {"family_ids": fid}})
+    families_col.update_one({"_id": _oid(fid)}, {"$pull": {"member_ids": uid}})
 
     return jsonify({"status": "left"})
 
@@ -318,27 +323,24 @@ def register_device(family_id):
     if not name:
         return jsonify({"error": "Device name is required"}), 400
 
-    devices = devices_db()
-
-    for d in devices.values():
-        if str(d["family_id"]) == str(family_id) and d["name"].lower() == name.lower():
+    fid = next((str(f) for f in user.get("family_ids", []) if str(f) == str(family_id)), str(family_id))
+    if not get_family(fid):
+        return jsonify({"error": "Family not found"}), 404
+    for d in devices_col.find({"family_id": fid}):
+        if d["name"].lower() == name.lower():
             return jsonify({"error": f"A device named '{name}' already exists in this family."}), 400
 
-    did = _next_id(devices)
-    device = {
-        "id": did,
+    result = devices_col.insert_one({
         "name": name,
         "device_type": device_type,
         "owner_user_id": user["id"],
-        "family_id": str(family_id),
+        "family_id": fid,
         "last_lat": None,
         "last_lng": None,
         "last_seen_at": None,
         "created_at": _now_iso(),
-    }
-    devices[did] = device
-    _write("devices", devices)
-    return jsonify(device_to_dict(device)), 201
+    })
+    return jsonify(device_to_dict(get_device(result.inserted_id))), 201
 
 
 @app.get("/api/families/<family_id>/devices")
@@ -347,8 +349,10 @@ def list_devices(family_id):
     user = current_user()
     if not _user_in_family(user, family_id):
         return jsonify({"error": "Not a member of this family"}), 403
-    devices = devices_db()
-    family_devices = [d for d in devices.values() if str(d["family_id"]) == str(family_id)]
+    family = get_family(family_id)
+    if not family:
+        return jsonify({"error": "Family not found"}), 404
+    family_devices = [_serialize(d) for d in devices_col.find({"family_id": family["id"]})]
     return jsonify([device_to_dict(d) for d in family_devices])
 
 
@@ -356,8 +360,7 @@ def list_devices(family_id):
 @jwt_required()
 def post_location(device_id):
     user = current_user()
-    devices = devices_db()
-    device = devices.get(str(device_id))
+    device = get_device(device_id)
     if not device:
         return jsonify({"error": "Device not found"}), 404
     if str(device["owner_user_id"]) != str(user["id"]):
@@ -376,10 +379,12 @@ def post_location(device_id):
         return jsonify({"error": "lat must be -90..90 and lng -180..180"}), 400
 
     now = _now_iso()
-    devices[str(device_id)].update({"last_lat": lat, "last_lng": lng, "last_seen_at": now})
-    _write("devices", devices)
+    devices_col.update_one(
+        {"_id": _oid(device["id"])},
+        {"$set": {"last_lat": lat, "last_lng": lng, "last_seen_at": now}},
+    )
 
-    d_out = device_to_dict(devices[str(device_id)])
+    d_out = device_to_dict(get_device(device["id"]))
     socketio.emit("location_update", {"device": d_out}, room=f"family-{device['family_id']}")
     return jsonify(d_out)
 
