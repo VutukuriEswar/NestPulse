@@ -1,0 +1,59 @@
+{
+  "name": "nestpulse",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@expo/metro-runtime": "~57.0.16",
+    "@react-navigation/bottom-tabs": "^6.6.1",
+    "@react-navigation/native": "^6.1.18",
+    "@react-navigation/native-stack": "^6.11.0",
+    "axios": "^1.7.2",
+    "expo": "^57.0.26",
+    "expo-asset": "~57.0.18",
+    "expo-location": "~57.0.20",
+    "expo-secure-store": "~57.0.4",
+    "expo-splash-screen": "~57.0.9",
+    "expo-status-bar": "~57.0.1",
+    "expo-task-manager": "~57.0.21",
+    "leaflet": "^1.9.4",
+    "lucide-react-native": "^1.52.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-maps": "1.27.2",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0",
+    "react-native-svg": "15.15.4",
+    "react-native-web": "^0.21.0",
+    "socket.io-client": "^4.7.5"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "wait-on": "^7.2.0"
+  },
+  "scripts": {
+    "start": "concurrently \"expo start\" \"wait-on http://localhost:8081 && electron electron/main.js\"",
+    "start:mobile": "expo start",
+    "start:web": "expo start --web",
+    "android": "expo run:android",
+    "build:exe": "expo export -p web && electron-builder",
+    "build:apk": "eas build -p android --profile preview"
+  },
+  "private": true,
+  "build": {
+    "appId": "com.nestpulse.app",
+    "productName": "NestPulse",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "files": [
+      "electron/main.js",
+      "dist/**/*"
+    ]
+  }
+}

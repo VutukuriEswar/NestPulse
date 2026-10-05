@@ -1,0 +1,443 @@
+import json
+import os
+import secrets
+import string
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    get_jwt_identity,
+    jwt_required,
+)
+from flask_socketio import SocketIO, join_room
+from werkzeug.security import check_password_hash, generate_password_hash
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-jwt-secret-change-me")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=int(os.environ.get("JWT_ACCESS_HOURS", "12")))
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
+
+jwt = JWTManager(app)
+CORS(app, origins="*", allow_headers=["*"])
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", manage_session=False)
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_file_locks: dict = {}
+
+def _lock(name: str) -> threading.Lock:
+    if name not in _file_locks:
+        _file_locks[name] = threading.Lock()
+    return _file_locks[name]
+
+
+def _read(name: str) -> dict:
+    path = DATA_DIR / f"{name}.json"
+    with _lock(name):
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+def _write(name: str, data: dict) -> None:
+    path = DATA_DIR / f"{name}.json"
+    with _lock(name):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _next_id(store: dict) -> str:
+    if not store:
+        return "1"
+    return str(max(int(k) for k in store.keys()) + 1)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def users_db() -> dict:    return _read("users")
+def families_db() -> dict: return _read("families")
+def devices_db() -> dict:  return _read("devices")
+
+
+def get_user(user_id) -> dict | None:
+    return users_db().get(str(user_id))
+
+
+def get_family(family_id) -> dict | None:
+    return families_db().get(str(family_id))
+
+
+def user_to_public(u: dict) -> dict:
+    return {"id": u["id"], "name": u["name"], "email": u["email"]}
+
+
+def device_to_dict(d: dict) -> dict:
+    users = users_db()
+    owner = users.get(str(d["owner_user_id"]))
+    return {
+        "id": d["id"],
+        "name": d["name"],
+        "device_type": d.get("device_type", "phone"),
+        "owner_user_id": d["owner_user_id"],
+        "owner_name": owner["name"] if owner else None,
+        "last_lat": d.get("last_lat"),
+        "last_lng": d.get("last_lng"),
+        "last_seen_at": d.get("last_seen_at"),
+    }
+
+
+def family_to_dict(f: dict, include_invite: bool = False) -> dict:
+    users = users_db()
+    members = [user_to_public(users[uid]) for uid in f.get("member_ids", []) if uid in users]
+    creator_id = f.get("creator_id") or (f["member_ids"][0] if f.get("member_ids") else None)
+    result = {"id": f["id"], "name": f["name"], "members": members, "creator_id": creator_id}
+    if include_invite:
+        result["invite_code"] = f["invite_code"]
+    return result
+
+
+def generate_invite_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def current_user() -> dict | None:
+    uid = get_jwt_identity()
+    return get_user(uid) if uid else None
+
+
+def _user_in_family(user: dict, family_id: str) -> bool:
+    return str(family_id) in [str(f) for f in user.get("family_ids", [])]
+
+
+@app.post("/api/auth/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not name or not email or len(password) < 6:
+        return jsonify({"error": "name, email, and a password of 6+ characters are required"}), 400
+
+    users = users_db()
+    if any(u["email"] == email for u in users.values()):
+        return jsonify({"error": "An account with that email already exists"}), 409
+
+    uid = _next_id(users)
+    user = {
+        "id": uid,
+        "name": name,
+        "email": email,
+        "password_hash": generate_password_hash(password),
+        "family_ids": [],
+        "created_at": _now_iso(),
+    }
+    users[uid] = user
+    _write("users", users)
+
+    access_token = create_access_token(identity=uid)
+    refresh_token = create_refresh_token(identity=uid)
+    return jsonify({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user_to_public(user),
+    }), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    try:
+        data = request.get_json()
+        if not data or "email" not in data or "password" not in data:
+            return jsonify({"error": "Missing email or password"}), 400
+
+        users = users_db()
+        user = next((u for u in users.values() if u["email"].lower() == data["email"].lower()), None)
+
+        if not user or not check_password_hash(user["password_hash"], data["password"]):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        access_token = create_access_token(identity=user["id"])
+        refresh_token = create_refresh_token(identity=user["id"])
+
+        return jsonify({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": user_to_public(user)
+        })
+    except Exception:
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.post("/api/auth/refresh")
+@jwt_required(refresh=True)
+def token_refresh():
+    uid = get_jwt_identity()
+    return jsonify({"access_token": create_access_token(identity=uid)})
+
+
+@app.get("/api/auth/me")
+@jwt_required()
+def me():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify(user_to_public(user))
+
+
+@app.get("/api/families")
+@jwt_required()
+def list_families():
+    user = current_user()
+    families = families_db()
+    result = []
+    for fid in user.get("family_ids", []):
+        f = families.get(str(fid))
+        if f:
+            result.append(family_to_dict(f, include_invite=True))
+    return jsonify(result)
+
+
+@app.post("/api/families")
+@jwt_required()
+def create_family():
+    user = current_user()
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Family name is required"}), 400
+
+    families = families_db()
+    users = users_db()
+
+    fid = _next_id(families)
+    family = {
+        "id": fid,
+        "name": name,
+        "invite_code": generate_invite_code(),
+        "creator_id": user["id"],
+        "member_ids": [user["id"]],
+        "created_at": _now_iso(),
+    }
+    families[fid] = family
+    _write("families", families)
+
+    if fid not in users[user["id"]].get("family_ids", []):
+        users[user["id"]].setdefault("family_ids", []).append(fid)
+        _write("users", users)
+
+    return jsonify(family_to_dict(family, include_invite=True)), 201
+
+
+@app.post("/api/families/join")
+@jwt_required()
+def join_family():
+    user = current_user()
+    data = request.get_json(silent=True) or {}
+    invite_code = (data.get("invite_code") or "").strip().upper()
+    if not invite_code:
+        return jsonify({"error": "invite_code is required"}), 400
+
+    families = families_db()
+    family = next((f for f in families.values() if f["invite_code"] == invite_code), None)
+    if not family:
+        return jsonify({"error": "Invite code not found"}), 404
+
+    fid = family["id"]
+    users = users_db()
+    uid = user["id"]
+
+    if uid not in family.get("member_ids", []):
+        families[fid]["member_ids"].append(uid)
+        _write("families", families)
+
+    if fid not in users[uid].get("family_ids", []):
+        users[uid].setdefault("family_ids", []).append(fid)
+        _write("users", users)
+
+    return jsonify(family_to_dict(families[fid], include_invite=True))
+
+
+@app.get("/api/families/<family_id>")
+@jwt_required()
+def get_single_family(family_id):
+    user = current_user()
+    if str(family_id) not in [str(f) for f in user.get("family_ids", [])]:
+        return jsonify({"error": "Not a member of this family"}), 403
+    family = get_family(family_id)
+    if not family:
+        return jsonify({"error": "Family not found"}), 404
+    return jsonify(family_to_dict(family, include_invite=True))
+
+
+@app.delete("/api/families/<family_id>/leave")
+@jwt_required()
+def leave_family(family_id):
+    user = current_user()
+    uid = user["id"]
+    fid = str(family_id)
+    users = users_db()
+    families = families_db()
+
+    if fid in users[uid].get("family_ids", []):
+        users[uid]["family_ids"].remove(fid)
+        _write("users", users)
+
+    if uid in families.get(fid, {}).get("member_ids", []):
+        families[fid]["member_ids"].remove(uid)
+        _write("families", families)
+
+    return jsonify({"status": "left"})
+
+
+@app.post("/api/families/<family_id>/devices")
+@jwt_required()
+def register_device(family_id):
+    user = current_user()
+    if not _user_in_family(user, family_id):
+        return jsonify({"error": "Not a member of this family"}), 403
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    device_type = (data.get("device_type") or "phone").strip()
+    if not name:
+        return jsonify({"error": "Device name is required"}), 400
+
+    devices = devices_db()
+
+    for d in devices.values():
+        if str(d["family_id"]) == str(family_id) and d["name"].lower() == name.lower():
+            return jsonify({"error": f"A device named '{name}' already exists in this family."}), 400
+
+    did = _next_id(devices)
+    device = {
+        "id": did,
+        "name": name,
+        "device_type": device_type,
+        "owner_user_id": user["id"],
+        "family_id": str(family_id),
+        "last_lat": None,
+        "last_lng": None,
+        "last_seen_at": None,
+        "created_at": _now_iso(),
+    }
+    devices[did] = device
+    _write("devices", devices)
+    return jsonify(device_to_dict(device)), 201
+
+
+@app.get("/api/families/<family_id>/devices")
+@jwt_required()
+def list_devices(family_id):
+    user = current_user()
+    if not _user_in_family(user, family_id):
+        return jsonify({"error": "Not a member of this family"}), 403
+    devices = devices_db()
+    family_devices = [d for d in devices.values() if str(d["family_id"]) == str(family_id)]
+    return jsonify([device_to_dict(d) for d in family_devices])
+
+
+@app.post("/api/devices/<device_id>/location")
+@jwt_required()
+def post_location(device_id):
+    user = current_user()
+    devices = devices_db()
+    device = devices.get(str(device_id))
+    if not device:
+        return jsonify({"error": "Device not found"}), 404
+    if str(device["owner_user_id"]) != str(user["id"]):
+        return jsonify({"error": "Only the device owner can update its location"}), 403
+    if not _user_in_family(user, device["family_id"]):
+        return jsonify({"error": "Not a member of this family"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        lat = float(data["lat"])
+        lng = float(data["lng"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "lat and lng (numbers) are required"}), 400
+
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({"error": "lat must be -90..90 and lng -180..180"}), 400
+
+    now = _now_iso()
+    devices[str(device_id)].update({"last_lat": lat, "last_lng": lng, "last_seen_at": now})
+    _write("devices", devices)
+
+    d_out = device_to_dict(devices[str(device_id)])
+    socketio.emit("location_update", {"device": d_out}, room=f"family-{device['family_id']}")
+    return jsonify(d_out)
+
+
+_authenticated_sids: dict = {}
+
+
+@socketio.on("connect")
+def handle_connect(auth):
+    token = (auth or {}).get("token", "")
+    if not token:
+        return False
+    try:
+        decoded = decode_token(token)
+        uid = decoded["sub"]
+        from flask_socketio import request as ws_req
+        _authenticated_sids[ws_req.sid] = uid
+        return True
+    except Exception:
+        return False
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    from flask_socketio import request as ws_req
+    _authenticated_sids.pop(ws_req.sid, None)
+
+
+@socketio.on("join_family")
+def handle_join_family(data):
+    from flask_socketio import request as ws_req
+    uid = _authenticated_sids.get(ws_req.sid)
+    if not uid:
+        return
+    user = get_user(uid)
+    if not user:
+        return
+    requested_fid = str((data or {}).get("family_id", ""))
+    if requested_fid and _user_in_family(user, requested_fid):
+        join_room(f"family-{requested_fid}")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok", "service": "NestPulse"})
+
+
+@app.errorhandler(404)
+def not_found(_e):
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.errorhandler(500)
+def server_error(_e):
+    return jsonify({"error": "Internal server error"}), 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "true").lower() == "true"
+    socketio.run(app, host="0.0.0.0", port=port, debug=debug, allow_unsafe_werkzeug=True)

@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "NestPulse",
+    "slug": "nestpulse-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0C12"
+      },
+      "package": "com.nestpulse.mobile",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/icon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-task-manager",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "NestPulse needs your location to share it with your family.",
+          "locationAlwaysPermission": "NestPulse needs your location in the background to keep your family updated.",
+          "locationWhenInUsePermission": "NestPulse needs your location to show it on the family map.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      "expo-asset",
+      "expo-status-bar",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/icon.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#0A0C12"
+        }
+      ]
+    ]
+  }
+}
